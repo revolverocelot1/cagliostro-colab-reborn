@@ -1,0 +1,303 @@
+# @title ## **Install Cagliostro Colab UI**
+import os
+import time
+import json
+import base64
+import shutil
+import subprocess
+import threading
+from IPython.display import display, HTML
+from google.colab.output import eval_js
+from IPython.utils import capture
+from tqdm import tqdm
+subprocess.run(['pip', 'install', '--upgrade', 'git+https://github.com/Linaqruf/colablib'])
+from colablib.colored_print import cprint, print_line
+from colablib.utils import py_utils, config_utils, package_utils
+from colablib.utils.ubuntu_utils import ubuntu_deps
+from colablib.sd_models.downloader import aria2_download
+from colablib.utils.git_utils import update_repo, batch_update, validate_repo, reset_repo, patch_repo
+
+%store -r
+
+################################
+# COLAB ARGUMENTS GOES HERE
+################################
+
+# @markdown ### **Drive Config**
+mount_drive         = False  # @param {type:'boolean'}
+output_drive_folder = "cagliostro-colab-ui/outputs" #@param {type:'string'}
+# @markdown ### **Repo Config**
+repo_type           = "AUTOMATIC1111" #@param ["AUTOMATIC1111", "AUTOMATIC1111-Dev", "Anapnoe"]
+update_webui        = False  # @param {type:'boolean'}
+update_extensions   = True  # @param {type:'boolean'}
+commit_hash         = ""  # @param {type:'string'}
+dpmpp_2m_v2_patch   = True  # @param {type:'boolean'}
+# @markdown ### **Optimization Config**
+# @markdown > It's not recommended to set params below to `True` if you have **Colab Pro** subscription.
+ram_alloc_patch     = True  # @param {type:'boolean'}
+colab_optimizations = True  # @param {type:'boolean'}
+# @markdown > Specify `mobile_optimizations` to keep colab tab alive for mobile users
+mobile_optimizations = False  # @param {type:'boolean'}
+
+################################
+# DIRECTORY CONFIG
+################################
+
+# VAR
+voldemort           = base64.b64decode("c3RhYmxlLWRpZmZ1".encode('ascii')).decode('ascii')
+voldy               = base64.b64decode("c2Qtd2VidWk=".encode('ascii')).decode('ascii')
+
+# ROOT DIR
+root_dir            = "/content"
+drive_dir           = os.path.join(root_dir, "drive", "MyDrive")
+repo_dir            = os.path.join(root_dir, "cagliostro-colab-ui")
+tmp_dir             = os.path.join(root_dir, "tmp")
+patches_dir         = os.path.join(root_dir, "patches")
+deps_dir            = os.path.join(root_dir, "deps")
+fused_dir           = os.path.join(root_dir, "fused")
+
+# REPO DIR
+models_dir          = os.path.join(repo_dir, "models", "Stable-diffusion")
+vaes_dir            = os.path.join(repo_dir, "models", "VAE")
+hypernetworks_dir   = os.path.join(repo_dir, "models", "hypernetworks")
+lora_dir            = os.path.join(repo_dir, "models", "Lora")
+control_dir         = os.path.join(repo_dir, "models", "ControlNet")
+esrgan_dir          = os.path.join(repo_dir, "models", "ESRGAN")
+embeddings_dir      = os.path.join(repo_dir, "embeddings")
+extensions_dir      = os.path.join(repo_dir, "extensions")
+annotator_dir       = os.path.join(extensions_dir, f"{voldy}-controlnet", "annotator")
+output_subdir       = ["txt2img-images", "img2img-images", "extras-images", "txt2img-grids", "img2img-grids"]
+
+# CONFIG 
+config_file         = os.path.join(repo_dir, "config.json")
+ui_config_file      = os.path.join(repo_dir, "ui-config.json")
+style_path          = os.path.join(repo_dir, "style.css")
+download_list       = os.path.join(root_dir, "download_list.txt")
+
+
+################################
+# REPO TYPE CONFIG
+################################
+
+package_url = [
+    f"https://huggingface.co/Linaqruf/fast-repo/resolve/main/{repo_type.lower()}-webui.tar.lz4",
+    f"https://huggingface.co/Linaqruf/fast-repo/resolve/main/{repo_type.lower()}-webui-deps.tar.lz4",
+    f"https://huggingface.co/Linaqruf/fast-repo/resolve/main/{repo_type.lower()}-webui-cache.tar.lz4",
+]
+
+repo_type_to_repo_name = {
+    "anapnoe"           : f"anapnoe/{voldemort}-ux",
+    "automatic1111"     : f"AUTOMATIC1111/{voldemort}",
+    "automatic1111-dev" : f"AUTOMATIC1111/{voldemort}",
+}
+
+branch_type_to_branch = {
+    "automatic1111"     : "master",
+    "automatic1111-dev" : "dev"
+}
+
+with capture.capture_output() as cap:
+    for dir in  ["root_dir", "fused_dir", "repo_dir", "tmp_dir", "models_dir", "vaes_dir", "hypernetworks_dir", "embeddings_dir", "extensions_dir", "lora_dir", "control_dir", "esrgan_dir"]:
+        %store {dir}
+    for file in ["config_file", "ui_config_file", "style_path", "download_list"]:
+        %store {file}
+    for var in  ["voldemort", "voldy"]:
+        %store {var}
+    del cap
+
+def mount_func(directory):
+    output_dir = os.path.join(repo_dir, "outputs")
+    
+    if mount_drive:
+        print_line(80, color="green")
+        if not os.path.exists(directory):
+            from google.colab import drive
+            cprint("Mounting google drive...", color="green", reset=False)
+            drive.mount(os.path.dirname(directory))
+        output_dir  = os.path.join(directory, output_drive_folder)
+        cprint("Set default output path to:", output_dir, color="green")
+
+    return output_dir
+
+def setup_directories():
+    for dir in [fused_dir, models_dir, vaes_dir, 
+                hypernetworks_dir, embeddings_dir, extensions_dir, 
+                lora_dir, control_dir, esrgan_dir]:
+        os.makedirs(dir, exist_ok=True)
+
+def pre_download(dir, urls, desc, overwrite=False):
+    gpu_info          = py_utils.get_gpu_info()
+    version           = py_utils.get_python_version().split()[0]
+    major_minor       = ".".join(version.split(".")[:2])
+    xformers_version  = "0.0.20"
+    python_path       = f"/usr/local/lib/python{major_minor}/dist-packages/"
+    ffmpy_path        = os.path.join(python_path, "ffmpy-0.3.0.dist-info")
+
+    for url in tqdm(urls, desc=desc):
+        filename  = py_utils.get_filename(url)
+        aria2_download(dir, filename, url, quiet=True)
+        if filename == f"{repo_type.lower()}-webui-deps.tar.lz4":
+            package_utils.extract_package(filename, python_path, overwrite=True)
+        else:
+            package_utils.extract_package(filename, "/", overwrite=overwrite)
+        os.remove(filename)
+
+    if os.path.exists(ffmpy_path):
+        shutil.rmtree(ffmpy_path)
+
+    if not 'T4' in gpu_info:
+        subprocess.run(['pip', 'uninstall', '-y', 'xformers'], check=True)
+        subprocess.run(['pip', 'install', '-q', f'xformers=={xformers_version}'], check=True)
+
+def install_dependencies():
+    ubuntu_deps_url = "https://huggingface.co/Linaqruf/fast-repo/resolve/main/ubuntu-deps.zip"
+    ram_patch_url   = "https://huggingface.co/Linaqruf/fast-repo/resolve/main/ram_patch.zip"
+
+    ubuntu_deps(ubuntu_deps_url, deps_dir, cprint("Installing ubuntu dependencies", color="green", tqdm_desc=True))
+
+    if ram_alloc_patch:
+        subprocess.run(["apt", "install",  'libunwind8-dev', "-y"], check=True)
+        ubuntu_deps(ram_patch_url, deps_dir, cprint("Installing RAM allocation patch", color="green", tqdm_desc=True))
+
+def install_webui(repo_dir, desc):
+    try:
+        if not os.path.exists(repo_dir):
+            pre_download(root_dir, package_url, desc, overwrite=False)
+            return
+        
+        repo_name, _, current_branch = validate_repo(repo_dir)
+        repo_type_lower = repo_type.lower()
+        expected_repo_name = repo_type_to_repo_name.get(repo_type_lower)
+        
+        if expected_repo_name == repo_name:
+            expected_branch = branch_type_to_branch.get(repo_type_lower)
+            if expected_branch is None or expected_branch == current_branch:
+                cprint(f"'{repo_name}' {current_branch if expected_branch else ''} already installed, skipping...", color="green")
+                return
+
+        cprint(f"Another repository exist. Uninstall '{repo_name}'...", color="green")
+        shutil.rmtree(repo_dir)  
+        pre_download(root_dir, package_url, desc)
+    except Exception as e:
+        cprint(f"An error occurred: {e}", color="green")
+
+def configure_output_path(config_path, output_dir, output_subdir):
+    config = config_utils.read_config(config_path)
+    config_updates = {
+        "outdir_txt2img_samples"  : os.path.join(output_dir, output_subdir[0]),
+        "outdir_img2img_samples"  : os.path.join(output_dir, output_subdir[1]),
+        "outdir_extras_samples"   : os.path.join(output_dir, output_subdir[2]),
+        "outdir_txt2img_grids"    : os.path.join(output_dir, output_subdir[3]),
+        "outdir_img2img_grids"    : os.path.join(output_dir, output_subdir[4])
+    }
+
+    config.update(config_updates)
+    config_utils.write_config(config_path, config)
+
+    for dir in output_subdir:
+        os.makedirs(os.path.join(output_dir, dir), exist_ok=True)
+
+def prepare_environment():
+    cprint(f"Preparing environment...", color="green")
+
+    os.environ["colab_url"]               = eval_js("google.colab.kernel.proxyPort(7860, {'cache': false})")
+    os.environ["TF_CPP_MIN_LOG_LEVEL"]    = "3"
+    os.environ["SAFETENSORS_FAST_GPU"]    = "1"
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = "garbage_collection_threshold:0.9,max_split_size_mb:512"
+    os.environ["PYTHONWARNINGS"]          = "ignore"
+
+def play_audio(url):
+    display(HTML(f'<audio src="{url}" controls autoplay style="display:none"></audio>'))
+
+def main():
+    global output_dir
+
+    os.chdir(root_dir)
+    start_time = time.time()
+    
+    output_dir = mount_func(drive_dir)
+
+    gpu_info    = py_utils.get_gpu_info(get_gpu_name=True)
+    python_info = py_utils.get_python_version()
+    torch_info  = py_utils.get_torch_version()
+
+    print_line(80, color="green")
+    cprint(f" [-] Current GPU:", gpu_info, color="flat_yellow")
+    cprint(f" [-] Python", python_info, color="flat_yellow")
+    cprint(f" [-] Torch", torch_info, color="flat_yellow")
+    print_line(80, color="green")
+
+    install_dependencies()
+
+    print_line(80, color="green")
+    install_webui(repo_dir, cprint(f"Unpacking {repo_type} Webui", color="green", tqdm_desc=True))
+    prepare_environment()
+    
+    configure_output_path(config_file, output_dir, output_subdir)
+
+    print_line(80, color="green")
+    if update_webui and not commit_hash:
+        update_repo(cwd=repo_dir, args="-X theirs --rebase --autostash")
+        
+    setup_directories ()
+
+    if commit_hash:
+        reset_repo(repo_dir, commit_hash)
+
+    repo_name, current_commit_hash, current_branch = validate_repo(repo_dir)
+    cprint(f"Using '{repo_name}' repository...", color="green")
+    cprint(f"Branch: {current_branch}, Commit hash: {current_commit_hash}", color="green")
+
+    print_line(80, color="green")
+    cprint("Hotfixes and Optimization:", color="green")
+
+    if dpmpp_2m_v2_patch:
+        dpmpp_2m_v2_url  = "https://gist.githubusercontent.com/Linaqruf/514d40676e97a70ffc3a2451bbf51555/raw/3fa447ebfac6b98a25485374b70447f848267589/01-add-DPMPP-2M-V2.patch"
+        patch_repo(url=dpmpp_2m_v2_url, dir=patches_dir, cwd=repo_dir, whitespace_fix=True, quiet=True)
+        shutil.rmtree(patches_dir)
+        cprint(" [-] DPM++ 2m V2 and DPM++ 2m Karras V2 patch done!", color="green")
+
+    if ram_alloc_patch:
+        os.environ["LD_PRELOAD"] = "libtcmalloc.so"
+        cprint(" [-] Camenduru's ram allocation patch done!", color="green")
+
+    if colab_optimizations:
+        lowram_patch_url = "https://raw.githubusercontent.com/ddPn08/automatic1111-colab/main/patches/stablediffusion-lowram.patch"
+        stable_diffusion_repo_dir = os.path.join(repo_dir, "repositories/stable-diffusion-stability-ai")
+        patch_repo(url=lowram_patch_url, dir=patches_dir, cwd=stable_diffusion_repo_dir, quiet=True)
+        shutil.rmtree(patches_dir)
+        cprint(" [-] Stable Diffusion V2.x lowram patch done!", color="green")
+
+        subprocess.run(["sed", "-i", f"s@os.path.splitext(checkpoint_file)@os.path.splitext(checkpoint_file); map_location='cuda'@", os.path.join(repo_dir, "modules", "sd_models.py")])
+        subprocess.run(["sed", "-i", f"s@ui.create_ui().*@ui.create_ui();shared.demo.queue(concurrency_count=999999,status_update_rate=0.1)@", os.path.join(repo_dir, "webui.py")])
+        subprocess.run(["sed", "-i", f"s@map_location='cpu'@map_location='cuda'@", os.path.join(repo_dir, "modules", "extras.py")])
+        cprint(" [-] TheLastben's colab optimization done!", color="green")
+
+    if mobile_optimizations:
+        audio_url    = "https://raw.githubusercontent.com/KoboldAI/KoboldAI-Client/main/colab/silence.m4a"
+        audio_thread = threading.Thread(target=play_audio, args=(audio_url,))
+        audio_thread.start()
+        cprint(" [-] Mobile Optimization done!", color="green")
+
+    if "anapnoe" in repo_name and "9931e861dfb128735c4a928a7beb5b5c0af30593" in current_commit_hash:
+        hires_prompt_fix = "https://gist.githubusercontent.com/Linaqruf/8fef456d53604f8c3bcd16722ea7d2f6/raw/a3382087c6e32f9a171f4b5e8aeb572a61682801/0001-Add-New-Label-for-Hires-Prompt.patch"
+        patch_repo(url=hires_prompt_fix, dir=patches_dir, cwd=repo_dir, whitespace_fix=True, quiet=True)
+        shutil.rmtree(patches_dir)
+        cprint(" [-] Hires Prompt patch done!", color="green")
+
+    print_line(80, color="green")
+    
+    if update_extensions:
+        batch_update(fetch=True, directory=extensions_dir, desc=cprint(f"Updating extensions", color="green", tqdm_desc=True))
+
+    if not os.path.exists(download_list):
+        download_list_url = "https://raw.githubusercontent.com/Linaqruf/sd-notebook-collection/main/config/download_list.txt"
+        aria2_download(os.path.dirname(download_list), os.path.basename(download_list), download_list_url, quiet=True)
+
+    elapsed_time = py_utils.calculate_elapsed_time(start_time)
+    print_line(80, color="green")
+    cprint(f"Finished installation. Took {elapsed_time}.", color="flat_yellow")
+    cprint("All is done! Go to the next step.", color="flat_yellow")
+    print_line(80, color="green")
+
+main()
